@@ -38,4 +38,3 @@ async def transcrever_audio(file: UploadFile = File(...)):
 
     data = response.json()
     return data["choices"][0]["message"]["content"]
-s
