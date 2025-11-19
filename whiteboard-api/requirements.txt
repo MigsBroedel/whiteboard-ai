@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-faster-whisper
 requests
+faster-whisper
+ctranslate2
+numpy
