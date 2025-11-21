@@ -8,13 +8,13 @@ from fastapi.responses import JSONResponse
 import requests
 from typing import List, Dict
 import json
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS para permitir requisições do frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,38 +23,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Usa modelo TINY para ser 4x mais rápido que base
+# Modelo TINY para velocidade máxima
 model = WhisperModel("tiny", device="cpu", compute_type="int8")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-SYSTEM_PROMPT = """Você é um assistente que converte falas em anotações estruturadas para whiteboard.
+SYSTEM_PROMPT = """Você é um assistente que converte falas em anotações para whiteboard canvas.
 
-Analise o texto e crie notas organizadas com posicionamento inteligente.
+Analise o texto transcrito e crie notas organizadas e posicionadas de forma inteligente.
 
-Responda APENAS com JSON válido neste formato:
+IMPORTANTE: Responda APENAS com JSON válido, SEM markdown, SEM comentários, SEM texto adicional.
+
+Formato EXATO do JSON:
 {
   "notes": [
-    {"text": "conteúdo da nota", "x": 50, "y": 50},
-    {"text": "outra nota", "x": 250, "y": 50}
+    {"text": "primeira nota aqui", "x": 100, "y": 100},
+    {"text": "segunda nota aqui", "x": 350, "y": 100}
   ],
   "connections": []
 }
 
-Regras:
-- Cada nota deve ter no máximo 80 caracteres
-- Distribua as notas em uma grade (espaçamento: 220px horizontal, 120px vertical)
-- Agrupe notas relacionadas próximas umas das outras
-- Comece em x=50, y=50"""
+REGRAS:
+1. Cada nota deve ter no máximo 80 caracteres
+2. Divida ideias longas em múltiplas notas
+3. Use coordenadas em grade:
+   - Primeira nota: x=100, y=100
+   - Notas seguintes: x aumenta +250px (horizontal)
+   - Nova linha: y aumenta +150px, x volta para 100
+4. Agrupe notas relacionadas próximas
+5. Máximo de 3 notas por linha
+6. Mantenha espaçamento consistente
+
+Exemplo para "precisamos comprar leite, ovos e pão amanhã":
+{
+  "notes": [
+    {"text": "Lista de Compras", "x": 100, "y": 100},
+    {"text": "🥛 Leite", "x": 100, "y": 250},
+    {"text": "🥚 Ovos", "x": 350, "y": 250},
+    {"text": "🍞 Pão", "x": 600, "y": 250},
+    {"text": "📅 Comprar amanhã", "x": 100, "y": 400}
+  ],
+  "connections": []
+}"""
 
 
 async def run_transcription(path: str):
-    """Executa transcrição em thread separada para não bloquear"""
+    """Executa transcrição em thread separada"""
     loop = asyncio.get_event_loop()
     
     def transcribe():
         try:
             segments, info = model.transcribe(path, language="pt")
-            return " ".join([s.text for s in segments])
+            text = " ".join([s.text for s in segments])
+            return text.strip()
         except Exception as e:
             logger.error(f"Erro na transcrição: {e}")
             raise
@@ -62,8 +82,30 @@ async def run_transcription(path: str):
     return await loop.run_in_executor(None, transcribe)
 
 
+def clean_json_response(content: str) -> str:
+    """Remove markdown e limpa resposta JSON"""
+    content = content.strip()
+    
+    # Remove blocos de código markdown
+    if "```json" in content:
+        content = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+        if content:
+            content = content.group(1)
+    elif "```" in content:
+        content = re.search(r'```\s*(\{.*?\})\s*```', content, re.DOTALL)
+        if content:
+            content = content.group(1)
+    
+    # Remove texto antes e depois do JSON
+    match = re.search(r'\{.*\}', content, re.DOTALL)
+    if match:
+        content = match.group(0)
+    
+    return content.strip()
+
+
 def get_llm_response(transcricao: str) -> Dict:
-    """Chama LLM e retorna JSON estruturado"""
+    """Chama LLM e retorna JSON estruturado para canvas"""
     try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -72,14 +114,15 @@ def get_llm_response(transcricao: str) -> Dict:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "openai/gpt-4o-mini",  # Modelo mais rápido e melhor
+                "model": "openai/gpt-4o-mini",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": transcricao}
+                    {"role": "user", "content": f"Transcrição: {transcricao}"}
                 ],
-                "temperature": 0.3
+                "temperature": 0.3,
+                "max_tokens": 1000
             },
-            timeout=20
+            timeout=25
         )
         
         if response.status_code != 200:
@@ -89,39 +132,69 @@ def get_llm_response(transcricao: str) -> Dict:
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         
-        # Remove markdown se houver
-        content = content.strip()
-        if content.startswith("```json"):
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif content.startswith("```"):
-            content = content.split("```")[1].split("```")[0].strip()
+        # Limpa resposta
+        content = clean_json_response(content)
+        logger.info(f"JSON limpo: {content[:200]}...")
         
-        return json.loads(content)
+        # Parseia JSON
+        result = json.loads(content)
+        
+        # Valida estrutura
+        if "notes" not in result:
+            raise ValueError("JSON não contém campo 'notes'")
+        
+        if not isinstance(result["notes"], list):
+            raise ValueError("Campo 'notes' deve ser uma lista")
+        
+        # Garante que todas as notas têm x, y e text
+        for note in result["notes"]:
+            if not all(k in note for k in ["text", "x", "y"]):
+                raise ValueError("Cada nota deve ter 'text', 'x' e 'y'")
+        
+        # Garante campo connections
+        if "connections" not in result:
+            result["connections"] = []
+        
+        return result
     
     except json.JSONDecodeError as e:
-        logger.error(f"Erro ao parsear JSON: {e}")
-        raise HTTPException(status_code=500, detail="Resposta inválida do LLM")
+        logger.error(f"Erro ao parsear JSON: {e}\nConteúdo: {content}")
+        # Retorna nota de erro como fallback
+        return {
+            "notes": [
+                {
+                    "text": "Erro: resposta do LLM inválida. Tente novamente.",
+                    "x": 100,
+                    "y": 100
+                }
+            ],
+            "connections": []
+        }
     except Exception as e:
-        logger.error(f"Erro na chamada LLM: {e}")
+        logger.error(f"Erro na chamada LLM: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/")
 async def health_check():
-    """Endpoint de health check"""
-    return {"status": "ok", "model": "tiny"}
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "model": "whisper-tiny",
+        "llm": "gpt-4o-mini"
+    }
 
 
 @app.post("/transcrever")
 async def transcrever_audio(file: UploadFile = File(...)):
     """
-    Endpoint principal: recebe áudio, transcreve e organiza em notas
+    Endpoint principal: recebe áudio, transcreve e retorna notas para canvas
     """
     temp_path = "/tmp/audio.webm"
     
     try:
-        # Salva arquivo temporário
-        logger.info(f"Recebendo arquivo: {file.filename}")
+        # Salva arquivo
+        logger.info(f"📥 Recebendo arquivo: {file.filename}")
         content = await file.read()
         
         if len(content) == 0:
@@ -130,31 +203,45 @@ async def transcrever_audio(file: UploadFile = File(...)):
         with open(temp_path, "wb") as f:
             f.write(content)
         
-        # Transcrição (~ 2-5 segundos com modelo tiny)
-        logger.info("Iniciando transcrição...")
+        # Transcrição (2-5s)
+        logger.info("🎙️ Iniciando transcrição...")
         transcricao = await run_transcription(temp_path)
-        logger.info(f"Transcrição concluída: {transcricao[:100]}...")
+        logger.info(f"✅ Transcrição: '{transcricao[:150]}...'")
         
-        if not transcricao or len(transcricao.strip()) < 5:
+        if not transcricao or len(transcricao) < 3:
             return JSONResponse({
-                "notes": [{"text": "Nenhuma fala detectada", "x": 50, "y": 50}],
+                "notes": [
+                    {
+                        "text": "⚠️ Nenhuma fala detectada no áudio",
+                        "x": 100,
+                        "y": 100
+                    }
+                ],
                 "connections": []
             })
         
-        # Processamento LLM (~ 2-3 segundos)
-        logger.info("Processando com LLM...")
+        # Processamento LLM (2-4s)
+        logger.info("🤖 Processando com LLM...")
         resultado = get_llm_response(transcricao)
-        logger.info("Processamento concluído!")
+        logger.info(f"✅ {len(resultado['notes'])} notas criadas!")
         
         return JSONResponse(resultado)
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro geral: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erro no processamento: {str(e)}")
+        logger.error(f"❌ Erro geral: {e}", exc_info=True)
+        return JSONResponse({
+            "notes": [
+                {
+                    "text": f"Erro: {str(e)[:100]}",
+                    "x": 100,
+                    "y": 100
+                }
+            ],
+            "connections": []
+        })
     finally:
-        # Limpa arquivo temporário
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
