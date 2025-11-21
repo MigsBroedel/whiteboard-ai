@@ -2,6 +2,6 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 requests==2.31.0
-faster-whisper==0.10.0
-ctranslate2==3.24.0
-numpy==1.26.3
+faster-whisper==1.1.0
+ctranslate2>=4.6.0
+numpy<2.0.0
